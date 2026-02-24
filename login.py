@@ -42,7 +42,7 @@ def register_page():
                 credentials[new_username] = new_user
                 write_credentials(storage_file, credentials)
                 st.success(f"用户 {new_username} 注册成功！请登录。")
-                st.experimental_rerun()
+                st.rerun()
 
 if __name__ == "__main__":
     if not st.session_state.logged_in:

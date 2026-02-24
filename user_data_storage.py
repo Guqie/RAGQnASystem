@@ -1,11 +1,11 @@
-
+# user_data_storage.py
 import json
 import os
 
 class Credentials:
     def __init__(self, username, password, is_admin=False):
         self.username = username
-        self.password = password
+        self.password = password # WARNING: Storing plaintext passwords is insecure
         self.is_admin = is_admin
 
     def to_dict(self):
@@ -17,33 +17,56 @@ class Credentials:
 
 def create_folder_if_not_exist(folder):
     if not os.path.exists(folder):
-        os.makedirs(folder)
+        try:
+            os.makedirs(folder)
+            print(f"Info: Created folder '{folder}'")
+        except Exception as e:
+            print(f"Error: Could not create folder '{folder}': {e}")
+
 
 def read_credentials(file_path):
     try:
         with open(file_path, "r") as file:
             data = json.load(file)
-            return {k: Credentials(**v) for k, v in data.items()}
-    except (FileNotFoundError, json.JSONDecodeError):
+            if isinstance(data, dict):
+                return {k: Credentials(**v) for k, v in data.items()}
+            else:
+                print(f"Warning: Credentials file '{file_path}' did not contain a valid dictionary.")
+                return {}
+    except FileNotFoundError:
+        print(f"Info: Credentials file '{file_path}' not found. A new one will be created with a default admin.")
         return {}
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode JSON from credentials file '{file_path}'. File might be corrupted.")
+        return {}
+    except Exception as e:
+        print(f"An unexpected error occurred while reading credentials file '{file_path}': {e}")
+        return {}
+
 
 def write_credentials(file_path, credentials_dict):
     data = {k: v.to_dict() for k, v in credentials_dict.items()}
-    with open(file_path, "w") as file:
-        json.dump(data, file, indent=4)
+    try:
+        with open(file_path, "w") as file:
+            json.dump(data, file, indent=4)
+    except Exception as e:
+        print(f"An unexpected error occurred while writing credentials to '{file_path}': {e}")
 
-# 文件存储位置
+# File storage location
 storage_folder = "tmp_data"
 storage_file = os.path.join(storage_folder, "user_credentials.json")
 
-# 确保文件夹存在
+# Ensure the folder exists before trying to read/write
 create_folder_if_not_exist(storage_folder)
 
-# 读取现有的用户数据
+# Load existing user data
 credentials = read_credentials(storage_file)
 
-# 如果初始文件为空，则初始化管理员账户
-if not credentials:
-    admin = Credentials("admin", "admin123", True)
-    credentials['admin'] = admin
+# If 'admin' user doesn't exist (e.g., first run or corrupted file), initialize it
+if 'admin' not in credentials:
+    print("Info: Default 'admin' account not found. Initializing with password 'admin123'.")
+    admin_username = "admin"
+    admin_password = "admin123" # WARNING: Highly insecure default password!
+    admin_user = Credentials(admin_username, admin_password, True)
+    credentials[admin_username] = admin_user
     write_credentials(storage_file, credentials)
