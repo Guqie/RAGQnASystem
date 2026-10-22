@@ -10,44 +10,35 @@
 
 ## 📌 项目简介
 
-本系统面向心理健康咨询场景，用户输入自然语言问题后，系统自动完成：
+本系统面向心理健康咨询场景。用户输入自然语言后，咨询 Agent 按下面的循环处理，而不是每次都走同一条固定流水线：
 
-1. **命名实体识别（NER）**：识别问题中的疾病、药品、症状等医疗实体
-2. **查询意图识别**：理解用户想查询的信息类型（病因、治疗方法、用药建议等）
-3. **知识图谱检索**：从 Neo4j 医疗知识图谱中精准获取结构化信息
-4. **大模型答案生成**：以心理咨询师的口吻，将知识图谱信息融合生成专业、有温度的回答
+1. **安全检查**：识别自杀、自伤等危机表述。命中后停止检索和用药讨论，直接给出援助热线
+2. **感知**：用词典（以及可选的 BERT NER）识别疾病、症状、药品
+3. **记忆**：把本轮问题和上一轮关注的疾病接上，处理「那要吃药吗」这类追问
+4. **规划**：由大模型选择工具；模型不可用或输出不合法时，退回关键词规则
+5. **工具调用**：按计划查询 Neo4j，必要时先用症状共现推断疾病，再查第二跳
+6. **回答**：以心理咨询师的口吻组织回复。没有 API Key 时，直接整理检索结果
 
 ---
 
 ## 🏗️ 系统架构
 
 ```
-用户输入自然语言问题
-        ↓
-┌─────────────────────────────────────┐
-│         NER 实体识别模块             │
-│  BERT+RNN 模型 + 规则匹配 + TF-IDF  │
-└─────────────────┬───────────────────┘
-                  ↓
-┌─────────────────────────────────────┐
-│         意图识别模块                 │
-│     Qwen2.5-3B-Instruct (本地)      │
-│     16种预定义查询意图分类           │
-└─────────────────┬───────────────────┘
-                  ↓
-┌─────────────────────────────────────┐
-│       知识图谱检索模块               │
-│    Neo4j + Cypher 结构化查询        │
-│    医疗实体关系图谱（8类实体）       │
-└─────────────────┬───────────────────┘
-                  ↓
-┌─────────────────────────────────────┐
-│         答案生成模块                 │
-│   DeepSeek API（流式输出）          │
-│   心理咨询师角色 Prompt 设计        │
-└─────────────────┬───────────────────┘
-                  ↓
-        Streamlit Web 界面展示
+用户输入
+   ↓
+安全检查 ──危机──→ 固定援助话术（不再查图谱、不讨论用药）
+   ↓ 通过
+实体感知 + 对话记忆
+   ↓
+规划器（大模型 JSON 计划，失败则规则规划）
+   ↓
+工具：症状推断 / 疾病查询 / 药品生产商 / 直接咨询
+   ↓
+必要时第二跳：用推断出的疾病再查资料
+   ↓
+咨询师回答（DeepSeek 流式；无密钥时整理检索结果）
+   ↓
+写回记忆，并在界面展示推理过程
 ```
 
 ---
@@ -87,10 +78,17 @@
 - 支持**症状反向推断疾病**（当用户描述症状而非疾病名时）
 - 知识图谱信息作为上下文注入 Prompt，引导大模型生成有据可查的回答
 
-### 4. 双模型协作
+### 4. 可解释的 Agent 循环
 
-- **本地模型**（Qwen2.5-3B）负责意图识别，低延迟、无需联网
-- **API 模型**（DeepSeek）负责最终答案生成，效果更优、支持流式输出
+- 规划器只允许调用四类动作：`infer_diseases`、`query_knowledge`、`query_drug`、`counsel_only`
+- 症状没有对应疾病名时，先做共现推断，再查询排名第一的疾病，并明确写上「不是诊断」
+- 每一轮的安全检查、实体、计划和工具结果会显示在「Agent 推理过程」里
+- 没有配置 `DEEPSEEK_API_KEY` 时，规则规划加检索结果仍然能完成一轮咨询
+
+### 5. 回答模型
+
+- DeepSeek 同时负责规划和最终回答，回答支持流式输出
+- 本地 Qwen 不再是启动系统的前置条件
 
 ---
 
@@ -98,10 +96,18 @@
 
 ```
 RAGQnASystem/
-├── webui.py                  # 主程序入口，Streamlit Web界面 + 问答核心链
+├── webui.py                  # Streamlit 入口，展示对话和 Agent 推理过程
+├── login.py                  # 用户登录注册模块
+├── agent/                    # 咨询 Agent
+│   ├── core.py               # 安全检查、规划、工具执行、回答
+│   ├── planner.py            # 大模型规划与规则回退
+│   ├── knowledge.py          # Neo4j / 内存图谱查询
+│   ├── dictionary.py         # 词典实体识别
+│   ├── memory.py             # 多轮记忆
+│   ├── safety.py             # 危机表述识别
+│   └── demo.py               # 不连数据库的离线演示
 ├── ner_model.py              # NER模型定义、训练与推理
 ├── ner_data.py               # NER训练数据处理
-├── login.py                  # 用户登录注册模块
 ├── user_data_storage.py      # 用户数据持久化
 ├── requirements.txt          # Python依赖列表
 │
@@ -153,59 +159,36 @@ cd RAGQnASystem
 
 ```bash
 pip install -r requirements.txt
-pip install langchain langchain-community langchain-openai
 ```
 
-### 3. 下载模型
+### 3. 配置环境变量
 
-**BERT 预训练模型**（chinese-roberta-wwm-ext）：
+复制 `.env.example` 为 `.env`，至少填入 Neo4j 密码。DeepSeek 密钥可以后补，没有它也能跑通检索和离线回复。
 
 ```bash
-# 方式一：ModelScope（国内推荐）
+DEEPSEEK_API_KEY=your_api_key_here
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_password
+```
+
+### 4. 下载 NER 模型（可选）
+
+没有 BERT 权重时，系统使用 `data/ent_aug` 词典做实体识别。需要恢复深度学习 NER 时再下载 chinese-roberta-wwm-ext，并把训练权重放到 `model/best_roberta_rnn_model_ent_aug.pt`。
+
+```bash
 pip install modelscope
 python -c "from modelscope import snapshot_download; snapshot_download('hfl/chinese-roberta-wwm-ext', cache_dir='./model')"
-
-# 方式二：HuggingFace
-git clone https://huggingface.co/hfl/chinese-roberta-wwm-ext model/chinese-roberta-wwm-ext
 ```
 
-**Qwen2.5-3B-Instruct 意图识别模型**：
-
-```bash
-python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen2.5-3B-Instruct')"
-```
-
-> 下载后请确认 `webui.py` 中 `LOCAL_INTENTION_MODEL_PATH` 路径与实际路径一致。
-
-### 4. 配置 Neo4j 知识图谱
+### 5. 配置 Neo4j 知识图谱
 
 ```bash
 # 启动 Neo4j 后，运行图谱构建脚本
 python data/build_up_graph.py
 ```
 
-修改 `webui.py` 中的连接信息：
-
-```python
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "your_password"
-```
-
-### 5. 配置 DeepSeek API Key
-
-推荐使用环境变量管理，避免硬编码：
-
-```bash
-export DEEPSEEK_API_KEY="your_api_key_here"
-```
-
-然后在 `webui.py` 中改为：
-
-```python
-import os
-DEEPSEEK_API_KEY_FROM_USER = os.environ.get("DEEPSEEK_API_KEY")
-```
+连接信息从环境变量读取，见上面的 `.env`。疾病属性查询同时兼容建图脚本里的「疾病简介 / 疾病病因 / 疾病易感人群」和旧字段名。
 
 ### 6. 训练 NER 模型（可选）
 
@@ -216,13 +199,23 @@ python ner_model.py
 # 训练完成后权重保存至 model/best_roberta_rnn_model_ent_aug.pt
 ```
 
-### 7. 启动系统
+### 7. 先看离线 Agent 演示
+
+不启动 Neo4j、也不配置 API Key：
 
 ```bash
-streamlit run webui.py
+python -m agent
 ```
 
-浏览器访问 `http://localhost:8501` 即可使用。
+演示会走三轮对话：疾病识别、追问用药、危机表述。图谱是内置样例，用来展示循环，不是完整医疗库。
+
+### 8. 启动系统
+
+```bash
+streamlit run login.py
+```
+
+浏览器访问 `http://localhost:8501`。默认管理员用户名是 `admin`。侧边栏可以展开每一轮的推理过程；勾选「使用内置演示图谱」后，不连接 Neo4j 也能走完疾病识别、追问和危机检查。
 
 ---
 
@@ -237,18 +230,19 @@ streamlit run webui.py
 得了强迫症会引发其他精神问题吗？
 ```
 
-**系统处理流程（以"焦虑症怎么治疗"为例）：**
+**系统处理流程（以「焦虑症怎么治疗」为例）：**
 
 ```
 输入：我朋友得了焦虑症，应该怎么治疗？
 
-① NER识别：{ "疾病": "焦虑症" }
-② 意图识别：["查询疾病的治疗方法", "查询疾病常用药品"]
-③ KG查询：
-   - 治疗方法：心理治疗、药物治疗、认知行为疗法...
-   - 常用药品：阿普唑仑、劳拉西泮...
-④ 生成回答：以心理咨询师口吻，融合知识图谱信息给出专业建议
+① 安全检查：通过
+② 实体识别：疾病 = 焦虑症
+③ 规划：query_knowledge，意图为治疗方法和常用药品
+④ 图谱查询：治疗方法、常用药品
+⑤ 生成回答：以心理咨询师口吻转述资料，并说明这不是诊断
 ```
+
+追问「那要吃药吗」时，Agent 会从记忆里取回「焦虑症」，而不是把这句话当成一个新话题。如果用户出现自杀、自伤表述，循环会在安全检查处停下。
 
 ---
 
@@ -258,11 +252,12 @@ streamlit run webui.py
 |------|------|
 | 前端框架 | Streamlit |
 | NER 模型 | BERT (chinese-roberta-wwm-ext) + 双向RNN |
-| 意图识别 | Qwen2.5-3B-Instruct |
-| 答案生成 | DeepSeek API (deepseek-chat / deepseek-reasoner) |
+| 规划与答案生成 | DeepSeek API；无密钥时使用规则规划 |
+| 多轮记忆 | 会话内疾病、症状和近期危机标记 |
+| 安全策略 | 危机表述短路，返回援助热线 |
 | 知识图谱 | Neo4j 5.x |
 | 图谱查询 | Cypher |
-| LLM 框架 | LangChain |
+| 大模型接口 | DeepSeek OpenAI 兼容接口 |
 | NER 规则 | Aho-Corasick (pyahocorasick) |
 | 实体对齐 | TF-IDF + 余弦相似度 (scikit-learn) |
 | 深度学习 | PyTorch + HuggingFace Transformers |
@@ -283,7 +278,8 @@ streamlit run webui.py
 
 1. `model/chinese-roberta-wwm-ext/` 和 `model/best_roberta_rnn_model_ent_aug.pt` 体积较大，已加入 `.gitignore`，需自行下载或训练
 2. `tmp_data/user_credentials.json` 包含用户数据，已加入 `.gitignore`，不随代码上传
-3. 请勿将 API Key 硬编码提交到公开仓库，建议使用环境变量管理
+3. 请勿将 API Key 写进源码。使用项目根目录的 `.env`，该文件已被 git 忽略
+4. 如果以前的提交里曾经包含过 API Key 或数据库密码，请在对应控制台作废旧密钥，只保留环境变量里的新密钥
 
 ---
 
