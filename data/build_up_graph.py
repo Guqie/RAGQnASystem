@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="通过medical.json文件,创建一个知识图谱")
     parser.add_argument('--website', type=str, default='http://localhost:7474', help='neo4j的连接网站')
     parser.add_argument('--user', type=str, default='neo4j', help='neo4j的用户名')
-    parser.add_argument('--password', type=str, default='wei8kang7.long', help='neo4j的密码')
+    parser.add_argument('--password', type=str, default=os.environ.get('NEO4J_PASSWORD', 'neo4j'), help='neo4j的密码，优先读取环境变量 NEO4J_PASSWORD')
     parser.add_argument('--dbname', type=str, default='neo4j', help='数据库名称')
     args = parser.parse_args()
 

@@ -22,7 +22,7 @@ def login_page():
                 st.session_state.logged_in = True
                 st.session_state.admin = user_cred.is_admin
                 st.session_state.usname = username
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("用户名或密码错误，请重新输入。")
 
