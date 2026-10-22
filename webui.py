@@ -18,8 +18,8 @@ import traceback
 langchain.verbose = True
 
 # --- 安全警告：硬编码API密钥 ---
-DEEPSEEK_API_KEY_FROM_USER = "sk-675fc771e6544564843fd32f52b34a03" 
-DEEPSEEK_API_BASE_URL = "https://api.deepseek.com/v1"
+DEEPSEEK_API_KEY_FROM_USER = os.environ.get("DEEPSEEK_API_KEY") or "sk-675fc771e6544564843fd32f52b34a03"
+DEEPSEEK_API_BASE_URL = os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com/v1")
 # --- 安全警告结束 ---
 
 # 确保模型路径正确且可访问
