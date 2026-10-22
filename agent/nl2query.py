@@ -136,8 +136,30 @@ def _bind(entity: str, fields: list) -> list:
     return bound
 
 
+def retrieval_text(question: str, statements: list) -> str:
+    """文档检索使用和图谱相同的查询语句，避免两路各猜一套字段。"""
+    hints = []
+    for item in statements:
+        field = getattr(item, "field", "") or ""
+        for hint in (getattr(item, "entity", ""), field, getattr(item, "target", "")):
+            if not hint or hint == "疾病" or hint in hints:
+                continue
+            hints.append(hint)
+        if "药" in field and "药品" not in hints:
+            hints.append("药品")
+    body = " ".join(hints)
+    question = (question or "").strip()
+    if question and body:
+        return f"{question} {body}"
+    return question or body
+
+
 def run_natural_query(question: str, entities: list, symptoms: list, drug: str | None, knowledge) -> NLResult:
-    statements = compile_statements(question, entities, symptoms, drug)
+    return execute_statements(question, compile_statements(question, entities, symptoms, drug), knowledge)
+
+
+def execute_statements(question: str, statements: list, knowledge) -> NLResult:
+    statements = list(statements)
     if not getattr(knowledge, "available", False):
         return NLResult(question, statements, "", [], unavailable=True, misses=[])
 

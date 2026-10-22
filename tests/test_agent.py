@@ -7,7 +7,7 @@ from agent.dictionary import DictionaryRecognizer
 from agent.knowledge import Neo4jKnowledge
 from agent.llm import ModelMessage, ToolCall
 from agent.memory import SessionMemory, load_session, save_session
-from agent.nl2query import compile_statements, run_natural_query
+from agent.nl2query import compile_statements, retrieval_text, run_natural_query
 from agent.rag import DocumentStore
 from agent.safety import is_crisis
 from agent.sample_kg import demo_documents, demo_knowledge
@@ -141,11 +141,18 @@ class AgentTests(unittest.TestCase):
                 )
             }
         )
-        turn = CounselingAgent(demo_knowledge(), recognizer, llm=None).step(query, SessionMemory())
+        turn = CounselingAgent(demo_knowledge(), recognizer, llm=None, documents=demo_documents()).step(
+            query, SessionMemory()
+        )
         self.assertEqual(turn.resolved_diseases[0], "抑郁症")
         self.assertTrue(any("症状推断" in item["stage"] for item in turn.trace))
         self.assertIn("不是诊断", turn.knowledge)
         self.assertIn("兴趣下降", turn.knowledge)
+        self.assertIn("1 抑郁症 疾病简介", turn.plan["statements"])
+        document_trace = next(item for item in turn.trace if item["stage"] == "工具 · 文档检索")
+        rewritten = document_trace["detail"].split("检索问句：", 1)[1]
+        self.assertIn("抑郁症", rewritten)
+        self.assertIn("抑郁症", turn.knowledge.split("【文档】", 1)[1])
 
     def test_greeting_does_not_dump_previous_disease_facts(self):
         memory = SessionMemory()
@@ -236,6 +243,9 @@ class AgentTests(unittest.TestCase):
         rendered = [item.format() for item in statements]
         self.assertIn("2 抑郁症 疾病使用药品 药品", rendered)
         self.assertIn("1 抑郁症 治疗周期", rendered)
+        shared = retrieval_text("那要吃药吗", statements)
+        self.assertIn("抑郁症", shared)
+        self.assertIn("疾病使用药品", shared)
 
     def test_dictionary_prefers_longer_entity(self):
         with tempfile.TemporaryDirectory() as folder:

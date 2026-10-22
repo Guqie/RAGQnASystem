@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 
 from agent import prompts
-from agent.nl2query import run_natural_query
+from agent.nl2query import retrieval_text, run_natural_query
 from agent.rag import DocumentStore, format_passages
 from agent.safety import CRISIS_RESPONSE, is_crisis
 from agent.types import Perception
@@ -208,7 +208,7 @@ class CounselingAgent:
 
         for name, arguments in calls:
             yield {"type": "status", "text": _status_text(name)}
-            detail, hit = self._invoke(name, arguments, memory)
+            detail, hit = self._invoke(name, arguments, memory, state)
             self._absorb(name, detail, hit, state, plan)
             yield _note(detail["stage"], detail["status"], detail["detail"])
 
@@ -249,7 +249,7 @@ class CounselingAgent:
             if follow and call.name == "query_knowledge_graph" and not arguments.get("entities"):
                 arguments.setdefault("question", query)
             yield {"type": "status", "text": _status_text(call.name)}
-            detail, hit = self._invoke(call.name, arguments, memory)
+            detail, hit = self._invoke(call.name, arguments, memory, state)
             self._absorb(call.name, detail, hit, state, plan)
             plan["tools"].append(call.name)
             notes.append(f"{call.name}\n{detail['detail'][:1200]}")
@@ -294,7 +294,7 @@ class CounselingAgent:
             return False
         return continues_medical(query)
 
-    def _invoke(self, name: str, arguments: dict, memory):
+    def _invoke(self, name: str, arguments: dict, memory, state=None):
         question = arguments.get("question") or ""
         if name == "query_knowledge_graph":
             perceived = self.recognizer.recognize(question) if question else Perception.empty()
@@ -315,11 +315,14 @@ class CounselingAgent:
             hit = result.hits if result.hits else ""
             return {"stage": stage, "status": status, "detail": detail, "result": result}, hit
         if name == "search_documents":
-            passages = self.documents.search(_document_query(question, arguments.get("symptoms")), k=3) if question else []
+            compiled = (state or {}).get("statement_objects") or arguments.get("statements") or []
+            expanded = retrieval_text(question, compiled) if compiled else _document_query(question, arguments.get("symptoms"))
+            passages = self.documents.search(expanded, k=3) if expanded else []
             text = format_passages(passages)
             status = "完成" if text else "无结果"
-            detail = text or "文档库没有命中片段。"
-            return {"stage": "工具 · 文档检索", "status": status, "detail": f"自然语言问题：{question}\n{detail}"}, text
+            body = text or "文档库没有命中片段。"
+            detail = f"自然语言问题：{question}\n检索问句：{expanded}\n{body}"
+            return {"stage": "工具 · 文档检索", "status": status, "detail": detail}, text
         if name == "recall_memory":
             text = memory.recall(question)
             return {"stage": "工具 · 历史记忆", "status": "完成", "detail": text}, text
@@ -329,7 +332,8 @@ class CounselingAgent:
         if name == "query_knowledge_graph":
             result = detail.get("result")
             if result is not None:
-                state["statements"].extend(item.format() for item in result.statements)
+                state["statement_objects"] = list(result.statements)
+                state["statements"] = [item.format() for item in result.statements]
                 state["resolved"].extend(name for name in result.diseases if name not in state["resolved"])
                 plan["statements"] = "\n".join(state["statements"])
             if hit:
