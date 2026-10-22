@@ -5,13 +5,14 @@ import streamlit as st
 
 from agent.bert_ner import load_bert_aligner, recognizer_backend
 from agent.config import settings
-from agent.core import CounselingAgent
+from agent.core import AgentTurn, CounselingAgent
 from agent.dictionary import DictionaryRecognizer, HybridRecognizer
 from agent.knowledge import Neo4jKnowledge
 from agent.llm import DeepSeekClient
-from agent.memory import SessionMemory
-from agent.prompts import offline_answer
-from agent.sample_kg import demo_knowledge
+from agent.memory import SessionMemory, load_session, memory_path, save_session
+from agent.rag import DocumentStore, LazyDocuments
+from agent.sample_kg import demo_documents, demo_knowledge
+from agent.types import Perception
 
 MODELS = {
     "DeepSeek-Chat": "deepseek-chat",
@@ -51,10 +52,11 @@ def connect_graph():
         socket.setdefaulttimeout(previous)
 
 
-def ensure_windows():
+def ensure_windows(username: str):
     if "windows" not in st.session_state:
-        st.session_state.windows = [{"messages": [], "memory": SessionMemory()}]
-        st.session_state.active = 0
+        windows, active = load_session(memory_path(settings.root, username))
+        st.session_state.windows = windows
+        st.session_state.active = active
     windows = st.session_state.windows
     if not windows:
         windows.append({"messages": [], "memory": SessionMemory()})
@@ -63,53 +65,89 @@ def ensure_windows():
     return windows[st.session_state.active]
 
 
+def persist_windows(username: str) -> None:
+    if "windows" not in st.session_state:
+        return
+    save_session(memory_path(settings.root, username), st.session_state.windows, st.session_state.active)
+
+
+def build_documents(use_demo: bool):
+    if use_demo:
+        return demo_documents()
+    source = settings.root / "data" / "medical_new_2.json"
+    if not source.exists():
+        return DocumentStore()
+    cache = settings.root / "tmp_data" / "rag_index.pkl"
+    return LazyDocuments(lambda: cached_store(source, cache))
+
+
+def cached_store(source, cache):
+    from agent.rag import cached_medical_store
+
+    return cached_medical_store(str(source), str(cache))
+
+
 def render_trace(trace: list) -> None:
     for item in trace:
         st.markdown(f"**{item['stage']}** · {item['status']}")
         st.write(item.get("detail") or "")
 
 
-def stream_answer(agent: CounselingAgent, turn, memory: SessionMemory, query: str, model_id: str) -> str:
-    if turn.final_text is not None:
-        st.markdown(turn.final_text)
-        return turn.final_text
+def consume_stream(agent: CounselingAgent, query: str, memory: SessionMemory, show_trace: bool):
     placeholder = st.empty()
+    status_box = st.empty()
     parts = []
-    try:
-        for token in agent.llm.stream(turn.messages, model=model_id):
-            parts.append(token)
+    trace = []
+    done = {}
+    for event in agent.stream(query, memory):
+        kind = event["type"]
+        if kind == "status":
+            status_box.caption(event["text"])
+        elif kind == "token":
+            parts.append(event["text"])
             placeholder.markdown("".join(parts) + "▌")
-        text = "".join(parts).strip()
-        if not text:
-            raise RuntimeError("模型没有返回内容")
-        placeholder.markdown(text)
-        return text
-    except Exception as exc:
-        text = offline_answer(
-            query,
-            memory,
-            turn.knowledge,
-            note=f"（大模型调用失败，已改为整理检索结果：{exc}）",
-        )
-        placeholder.markdown(text)
-        return text
+        elif kind == "trace":
+            trace.append(event["item"])
+        elif kind == "done":
+            done = event
+    text = "".join(parts).strip() or "（没有生成回复）"
+    placeholder.markdown(text)
+    status_box.empty()
+    if show_trace and trace:
+        with st.expander("Agent 推理过程", expanded=True):
+            render_trace(trace)
+    turn = AgentTurn(
+        final_text=text,
+        messages=done.get("messages"),
+        trace=trace,
+        knowledge=done.get("knowledge") or "",
+        plan=done.get("plan") or {},
+        perception=done.get("perception") or Perception.empty(),
+        resolved_diseases=list(done.get("resolved_diseases") or []),
+        symptoms=list(done.get("symptoms") or []),
+        intents=list(done.get("intents") or []),
+        drug=done.get("drug"),
+        crisis=bool(done.get("crisis")),
+    )
+    return text, turn
 
 
 def main(is_admin, usname):
     st.set_page_config(page_title="心理咨询 Agent", layout="centered")
     st.title("心理咨询 Agent")
-    st.caption("先判断要不要查知识图谱，再决定回答。支持多轮记忆，遇到危机表述会停止用药讨论。")
+    st.caption("自然语言问题会同时查知识图谱和疾病文档，回答按片段流出。对话保留长上下文，更早的内容可以再检索。")
 
     with st.sidebar:
         logo = settings.root / "img" / "logo.jpg"
         if logo.exists():
             st.image(str(logo), use_column_width=True)
-        st.caption(f"欢迎你，{'管理员' if is_admin else '用户'} {usname}。当前版本：2.0")
+        st.caption(f"欢迎你，{'管理员' if is_admin else '用户'} {usname}。当前版本：3.0")
 
-        ensure_windows()
+        ensure_windows(usname)
         if st.button("新建对话窗口"):
             st.session_state.windows.append({"messages": [], "memory": SessionMemory()})
             st.session_state.active = len(st.session_state.windows) - 1
+            persist_windows(usname)
             st.rerun()
 
         labels = [f"对话窗口 {index + 1}" for index in range(len(st.session_state.windows))]
@@ -121,7 +159,7 @@ def main(is_admin, usname):
         show_trace = st.checkbox("显示 Agent 推理过程", value=True)
         use_demo_graph = st.checkbox("使用内置演示图谱", value=False)
         if use_demo_graph:
-            st.info("演示图谱只包含抑郁症和焦虑症的样例，用来离线展示 Agent，不是完整医疗库。")
+            st.info("演示知识库只包含抑郁症和焦虑症的图谱和文档样例，用来离线展示检索，不是完整医疗库。")
 
         if "graph_client" not in st.session_state:
             client, error = connect_graph()
@@ -141,7 +179,7 @@ def main(is_admin, usname):
         if api_ready:
             st.success("回答模型已配置")
         else:
-            st.info("未配置 DEEPSEEK_API_KEY。系统仍会检索，并用检索结果整理回复。")
+            st.info("未配置 DEEPSEEK_API_KEY。系统仍会调用检索工具，并把结果分段流式整理出来。")
 
         if is_admin:
             st.markdown("---")
@@ -155,7 +193,7 @@ def main(is_admin, usname):
             st.session_state.logged_in = False
             st.rerun()
 
-    window = ensure_windows()
+    window = ensure_windows(usname)
     memory = window["memory"]
     history = window["messages"]
 
@@ -170,7 +208,7 @@ def main(is_admin, usname):
         knowledge = demo_knowledge()
     else:
         knowledge = Neo4jKnowledge(st.session_state.get("graph_client"))
-    agent = CounselingAgent(knowledge, recognizer, llm)
+    agent = CounselingAgent(knowledge, recognizer, llm, documents=build_documents(use_demo_graph))
 
     for message in history:
         with st.chat_message(message["role"]):
@@ -181,6 +219,7 @@ def main(is_admin, usname):
 
     query = st.chat_input("想聊什么都可以，也可以问疾病、症状或用药")
     if not query:
+        persist_windows(usname)
         return
 
     history.append({"role": "user", "content": query})
@@ -189,12 +228,8 @@ def main(is_admin, usname):
 
     with st.chat_message("assistant"):
         try:
-            with st.spinner("正在识别问题并检索知识图谱..."):
-                turn = agent.step(query, memory)
-            answer = stream_answer(agent, turn, memory, query, model_id)
-            if show_trace:
-                with st.expander("Agent 推理过程", expanded=True):
-                    render_trace(turn.trace)
+            answer, turn = consume_stream(agent, query, memory, show_trace)
+            turn_trace = turn.trace
         except Exception:
             detail = traceback.format_exc()
             print(detail)
@@ -202,12 +237,11 @@ def main(is_admin, usname):
             turn_trace = [{"stage": "错误", "status": "失败", "detail": "内部错误已记录在服务端日志。"}]
             st.error(answer)
             turn = None
-        else:
-            turn_trace = turn.trace
 
     if turn is not None:
         memory.observe(query, answer, turn)
     history.append({"role": "assistant", "content": answer, "trace": turn_trace})
+    persist_windows(usname)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ model/best_roberta_rnn_model_ent_aug.pt
 __pycache__/
 tmp_data/user_credentials.json
 tmp_data/app_interactions.log.jsonl
+tmp_data/memory/
+tmp_data/rag_index.pkl
 .env
 *.ipynb_checkpoints/
 .ipynb_checkpoints/

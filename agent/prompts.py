@@ -25,6 +25,13 @@ SYSTEM_PROMPT = """你是一名专业、有耐心的心理咨询师，同时会�
 用药信息只转述资料中出现的名称，并说明需要在医生指导下使用。
 图谱里的“症状共现”只能说“可能相关”，不能说用户已经被诊断为某种疾病。"""
 
+TOOL_GUIDE = """
+回答医疗问题前先调用工具，不要凭空编造药名、剂量或诊断。
+- query_knowledge_graph：传入一句自然语言检索问题。系统会把它编译成「1 实体 属性 / 2 实体 关系 目标」这样的图谱查询并执行。用户如果在追问，先把疾病名补进 question。
+- search_documents：同一句自然语言，去疾病文档库里检索简介、病因等原文。
+- recall_memory：只有需要当前窗口之外的更早对话时才调用。
+工具返回后，再按咨询师的方式组织回答。"""
+
 CRISIS_CAUTION = """
 另外，最近几轮对话里出现过危机表述。回复开头先确认对方现在是否安全、身边有没有人，再非常谨慎地谈及其他问题。不要提供剂量，不要把检索结果说成治疗方案。"""
 
@@ -39,7 +46,7 @@ def build_messages(query: str, memory, knowledge: str) -> list:
 用户当前的话：
 {query}
 
-知识图谱检索结果：
+知识库返回（图谱查询结果和文档片段）：
 {knowledge}
 """
     return [
@@ -55,7 +62,7 @@ def offline_answer(query: str, memory, knowledge: str, note: str | None = None) 
     if memory.crisis_turns_left:
         parts.append("我更关心你现在是否安全。如果危险还在，请先联系身边的人或拨打 12356。")
     if knowledge and knowledge not in {COUNSEL_ONLY_KNOWLEDGE, EMPTY_KNOWLEDGE, UNAVAILABLE_KNOWLEDGE}:
-        parts.append("我查了知识图谱。下面是可以参考的资料，它不是诊断：")
+        parts.append("我查了知识库。下面是图谱查询和文档检索返回的资料，它不是诊断：")
         parts.append(knowledge)
     elif knowledge == UNAVAILABLE_KNOWLEDGE:
         parts.append("知识图谱这会儿没有连上，我没法引用具体的疾病条目。")

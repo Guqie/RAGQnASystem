@@ -52,3 +52,9 @@ DEMO_PRODUCERS = {"舍曲林": ["演示药厂"]}
 
 def demo_knowledge() -> InMemoryKnowledge:
     return InMemoryKnowledge(DEMO_RECORDS, DEMO_PRODUCERS)
+
+
+def demo_documents():
+    from agent.rag import DocumentStore
+
+    return DocumentStore.from_records(DEMO_RECORDS)

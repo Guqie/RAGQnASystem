@@ -5,10 +5,12 @@ from pathlib import Path
 from agent.core import CounselingAgent
 from agent.dictionary import DictionaryRecognizer
 from agent.knowledge import Neo4jKnowledge
-from agent.memory import SessionMemory
-from agent.planner import extract_json_object, normalize_plan, rule_plan, select_intents
+from agent.llm import ModelMessage, ToolCall
+from agent.memory import SessionMemory, load_session, save_session
+from agent.nl2query import compile_statements, run_natural_query
+from agent.rag import DocumentStore
 from agent.safety import is_crisis
-from agent.sample_kg import demo_knowledge
+from agent.sample_kg import demo_documents, demo_knowledge
 from agent.types import Perception
 
 
@@ -47,12 +49,20 @@ class MapRecognizer:
         return self.mapping.get(text, Perception.empty())
 
 
-class FakeLLM:
-    def __init__(self, content):
-        self.content = content
+class ToolLLM:
+    def __init__(self, calls=None, chunks=None, explode=False):
+        self.calls = calls or []
+        self.chunks = chunks or ["资料里的生产商是", "演示药厂。"]
+        self.explode = explode
 
-    def complete(self, messages, **kwargs):
-        return self.content
+    def complete_with_tools(self, messages, tools, **kwargs):
+        if self.explode:
+            raise RuntimeError("工具接口不可用")
+        return ModelMessage(tool_calls=self.calls)
+
+    def stream(self, messages, **kwargs):
+        for chunk in self.chunks:
+            yield chunk
 
 
 class BoomKnowledge:
@@ -103,16 +113,20 @@ class AgentTests(unittest.TestCase):
                 )
             }
         )
-        agent = CounselingAgent(demo_knowledge(), recognizer, llm=None)
+        agent = CounselingAgent(demo_knowledge(), recognizer, llm=None, documents=demo_documents())
         memory = SessionMemory()
         first_turn = agent.step(first, memory)
         self.assertEqual(first_turn.resolved_diseases, ["抑郁症"])
+        self.assertIn("1 抑郁症 疾病简介", first_turn.plan["statements"])
         self.assertIn("心境障碍", first_turn.knowledge)
+        self.assertIn("【文档】", first_turn.knowledge)
         memory.observe(first, first_turn.final_text, first_turn)
 
         second_turn = agent.step(second, memory)
         self.assertEqual(second_turn.resolved_diseases, ["抑郁症"])
+        self.assertIn("2 抑郁症 疾病使用药品 药品", second_turn.plan["statements"])
         self.assertIn("舍曲林", second_turn.knowledge)
+        self.assertIn("舍曲林", second_turn.knowledge.split("【文档】", 1)[-1])
         self.assertIn("沿用上一轮", second_turn.plan["reasoning"])
         self.assertTrue(second_turn.plan["use_memory"])
 
@@ -138,27 +152,27 @@ class AgentTests(unittest.TestCase):
         memory.focus_diseases = ["抑郁症"]
         memory.turns.append(type("T", (), {"query": "之前", "answer_brief": "聊过"})())
         turn = CounselingAgent(demo_knowledge(), MapRecognizer(), llm=None).step("你好", memory)
-        self.assertEqual(turn.plan["actions"][0]["tool"], "counsel_only")
+        self.assertEqual(turn.plan["tools"], [])
         self.assertNotIn("舍曲林", turn.knowledge)
+        self.assertNotIn("舍曲林", turn.final_text)
 
-    def test_llm_plan_is_used_when_json_is_valid(self):
-        raw = """思考如下：
-```json
-{"reasoning":"问生产商","use_memory":false,"intents":["查询药品的生产商","不存在的意图"],"actions":[{"tool":"query_drug","drug":"舍曲林"}]}
-```
-"""
+    def test_model_tool_call_queries_graph_then_streams(self):
         query = "舍曲林是哪家生产的"
         recognizer = MapRecognizer(
             {query: Perception(mentions=[], drug="舍曲林", by_type={"药品": ["舍曲林"]})}
         )
-        turn = CounselingAgent(demo_knowledge(), recognizer, FakeLLM(raw)).step(query, SessionMemory())
+        llm = ToolLLM(
+            calls=[ToolCall("call-1", "query_knowledge_graph", '{"question":"舍曲林是哪家生产的","drug":"舍曲林"}')]
+        )
+        turn = CounselingAgent(demo_knowledge(), recognizer, llm).step(query, SessionMemory())
         self.assertEqual(turn.plan["source"], "llm")
-        self.assertIsNone(turn.final_text)
+        self.assertIn("query_knowledge_graph", turn.plan["tools"])
+        self.assertIn("2 舍曲林 生产 药品商", turn.plan["statements"])
         self.assertIn("演示药厂", turn.knowledge)
+        self.assertIn("演示药厂", turn.final_text)
         self.assertIn("演示药厂", turn.messages[1]["content"])
-        self.assertNotIn("不存在的意图", turn.plan["intents"])
 
-    def test_invalid_llm_plan_falls_back_to_rules(self):
+    def test_tool_call_failure_falls_back_to_local_query(self):
         query = "我最近情绪低落，还失眠，这是抑郁症吗？"
         recognizer = MapRecognizer(
             {
@@ -170,12 +184,14 @@ class AgentTests(unittest.TestCase):
                 )
             }
         )
-        turn = CounselingAgent(demo_knowledge(), recognizer, FakeLLM("我不会输出 JSON")).step(
-            query, SessionMemory()
-        )
-        self.assertEqual(turn.plan["source"], "rule")
-        self.assertIn("规则回退", [item["status"] for item in turn.trace])
+        turn = CounselingAgent(
+            demo_knowledge(),
+            recognizer,
+            ToolLLM(explode=True, chunks=["已按本地查询整理回复。"]),
+        ).step(query, SessionMemory())
+        self.assertIn("回退", [item["status"] for item in turn.trace])
         self.assertEqual(turn.resolved_diseases, ["抑郁症"])
+        self.assertIn("心境障碍", turn.knowledge)
 
     def test_missing_graph_skips_execution_but_keeps_plan(self):
         query = "抑郁症怎么治疗"
@@ -184,8 +200,9 @@ class AgentTests(unittest.TestCase):
         )
         turn = CounselingAgent(Neo4jKnowledge(None), recognizer, llm=None).step(query, SessionMemory())
         self.assertIn("没有连上", turn.knowledge)
+        self.assertIn("2 抑郁症 治疗的方法 治疗方法", turn.plan["statements"])
         self.assertTrue(any(item["status"] == "跳过" for item in turn.trace))
-        self.assertIn("治疗", turn.plan["reasoning"])
+        self.assertTrue(any("查询语句" in item["detail"] for item in turn.trace))
 
     def test_cypher_matches_graph_property_names(self):
         graph = ScriptedGraph()
@@ -204,16 +221,21 @@ class AgentTests(unittest.TestCase):
         rows = knowledge.diseases_by_symptoms(["失眠", "情绪低落"])
         self.assertEqual(rows[0]["name"], "抑郁症")
         self.assertEqual(graph.calls[-1][1]["symptoms"], ["失眠", "情绪低落"])
+        graph.calls.clear()
+        result = run_natural_query("抑郁症的病因是什么", ["抑郁症"], [], None, knowledge)
+        self.assertIn("1 抑郁症 疾病病因", result.statements_text)
+        cypher = "\n".join(call[0] for call in graph.calls)
+        self.assertIn("d.`疾病病因`", cypher)
 
-    def test_rule_planner_limits_intents_and_parses_messy_json(self):
-        intents = select_intents("那要吃药吗？怎么治疗，要多久")
-        self.assertLessEqual(len(intents), 3)
-        self.assertIn("查询疾病常用药品", intents)
-        self.assertIn("查询疾病的治疗方法", intents)
-        parsed = extract_json_object('前文 {"reasoning":"ok","actions":[{"tool":"counsel_only"}]} 后文')
-        plan = normalize_plan(parsed)
-        self.assertEqual(plan["actions"][0]["tool"], "counsel_only")
-        self.assertIsNone(normalize_plan({"actions": [{"tool": "delete_database"}]}))
+    def test_natural_query_caps_statements(self):
+        statements = compile_statements("那要吃药吗？怎么治疗，要多久", ["抑郁症", "焦虑症"], [], None)
+        fields = {item.field for item in statements}
+        self.assertIn("疾病使用药品", fields)
+        self.assertIn("治疗的方法", fields)
+        self.assertLessEqual(len(statements), 4)
+        rendered = [item.format() for item in statements]
+        self.assertIn("2 抑郁症 疾病使用药品 药品", rendered)
+        self.assertIn("1 抑郁症 治疗周期", rendered)
 
     def test_dictionary_prefers_longer_entity(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -261,6 +283,45 @@ class AgentTests(unittest.TestCase):
         self.assertIn("焦虑症", text)
         self.assertIn("心慌", text)
         self.assertIn("我是不是焦虑症", text)
+
+    def test_document_search_prefers_matching_disease(self):
+        store = DocumentStore()
+        store.add("抑郁症", "简介", "以显著而持久的情绪低落为主要表现的心境障碍")
+        store.add("百日咳", "简介", "百日咳是一种阵发性痉挛性咳嗽")
+        store.finalize()
+        found = store.search("抑郁症的心境障碍简介", k=2)
+        self.assertEqual(found[0]["disease"], "抑郁症")
+
+    def test_long_context_recall_and_disk(self):
+        memory = SessionMemory()
+        blank = type(
+            "Turn",
+            (),
+            {"crisis": False, "resolved_diseases": ["抑郁症"], "symptoms": [], "drug": None, "intents": []},
+        )()
+        for index in range(8):
+            memory.observe(f"第{index}个问题", "当时在聊睡眠", blank)
+        self.assertTrue(any("第0个问题" in line for line in memory.summary_lines))
+        recent = "\n".join(item.query for item in memory.turns)
+        self.assertNotIn("第0个问题", recent)
+        self.assertIn("第7个问题", recent)
+        self.assertIn("第0个问题", memory.recall("第0个问题"))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "session.json"
+            save_session(path, [{"messages": [{"role": "user", "content": "第7个问题"}], "memory": memory}], 0)
+            loaded, active = load_session(path)
+        self.assertEqual(active, 0)
+        self.assertEqual(loaded[0]["messages"][0]["content"], "第7个问题")
+        self.assertEqual(loaded[0]["memory"].focus_diseases, ["抑郁症"])
+        self.assertIn("第0个问题", loaded[0]["memory"].recall("第0个问题"))
+
+    def test_stream_emits_multiple_tokens(self):
+        agent = CounselingAgent(demo_knowledge(), MapRecognizer(), llm=None)
+        events = list(agent.stream("你好", SessionMemory()))
+        tokens = [event for event in events if event["type"] == "token"]
+        self.assertGreater(len(tokens), 1)
+        self.assertTrue(any(event["type"] == "done" for event in events))
+        self.assertIn("我在听", "".join(event["text"] for event in tokens))
 
 
 if __name__ == "__main__":

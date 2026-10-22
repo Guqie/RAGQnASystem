@@ -8,7 +8,7 @@ from agent.config import settings
 from agent.core import CounselingAgent
 from agent.dictionary import DictionaryRecognizer
 from agent.memory import SessionMemory
-from agent.sample_kg import demo_knowledge
+from agent.sample_kg import demo_documents, demo_knowledge
 from agent.types import Perception
 
 
@@ -51,6 +51,9 @@ def run_dialogue(agent: CounselingAgent, queries: list) -> SessionMemory:
         for item in turn.trace:
             print(f"\n[{item['stage']} · {item['status']}]")
             print(item["detail"])
+        if turn.plan.get("statements"):
+            print("\n[查询语句]")
+            print(turn.plan["statements"])
         print("\n[回复]")
         print(turn.final_text or "（已生成提示词，等待大模型）")
         memory.observe(query, turn.final_text or "", turn)
@@ -59,10 +62,10 @@ def run_dialogue(agent: CounselingAgent, queries: list) -> SessionMemory:
 
 def main():
     recognizer = build_demo_recognizer()
-    agent = CounselingAgent(demo_knowledge(), recognizer, llm=None)
+    agent = CounselingAgent(demo_knowledge(), recognizer, llm=None, documents=demo_documents())
     print("心理咨询 Agent 离线演示")
     print(f"实体识别：{recognizer_backend(recognizer)}")
-    print("图谱：内置演示数据，不是完整的 Neo4j 医疗图谱。")
+    print("知识库：内置演示图谱 + 对应疾病文档，不是完整医疗库。")
     queries = [
         "我最近情绪低落，总是失眠，这是抑郁症吗？",
         "那应该怎么治疗，要吃药吗？",

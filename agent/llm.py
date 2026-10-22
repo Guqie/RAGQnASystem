@@ -1,8 +1,23 @@
-"""DeepSeek 的 OpenAI 兼容接口。规划走一次性补全，回答走流式输出。"""
+"""DeepSeek 的 OpenAI 兼容接口。工具调用走非流式补全，最终回答走流式输出。"""
 
 import json
+from dataclasses import dataclass, field
+
 import urllib.error
 import urllib.request
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass
+class ModelMessage:
+    content: str = ""
+    tool_calls: list = field(default_factory=list)
 
 
 class DeepSeekClient:
@@ -46,6 +61,25 @@ class DeepSeekClient:
         with self._request(payload, timeout=60) as response:
             body = json.loads(response.read().decode("utf-8"))
         return body["choices"][0]["message"].get("content") or ""
+
+    def complete_with_tools(self, messages, tools, temperature: float = 0.2, max_tokens: int = 800, model: str | None = None):
+        payload = self._payload(messages, temperature, max_tokens, False, model)
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+        with self._request(payload, timeout=60) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        message = body["choices"][0]["message"]
+        calls = []
+        for raw in message.get("tool_calls") or []:
+            function = raw.get("function") or {}
+            calls.append(
+                ToolCall(
+                    id=raw.get("id") or "",
+                    name=function.get("name") or "",
+                    arguments=function.get("arguments") or "{}",
+                )
+            )
+        return ModelMessage(content=message.get("content") or "", tool_calls=calls)
 
     def stream(self, messages, temperature: float = 0.6, max_tokens: int = 2000, model: str | None = None):
         payload = self._payload(messages, temperature, max_tokens, True, model)
